@@ -1,0 +1,17 @@
+# Python Virtual Environment
+.venv/
+__pycache__/
+
+# Datasets and generated images
+dataset/
+*.png
+*.jpg
+labels.json
+
+# Model weights
+*.pt
+*.pth
+
+# OS generated files
+.DS_Store
+Thumbs.db
