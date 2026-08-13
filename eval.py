@@ -67,18 +67,32 @@ def evaluate():
             gt_x = item['gt_x']
             gt_y = item['gt_y']
             
+            # Absolute Error (Misleading on repeating DRAM grid)
             err = np.sqrt((pred_x - gt_x)**2 + (pred_y - gt_y)**2)
             errors.append(err)
+            
+            # Subpixel Phase Error: The TRUE metric for repeating structures!
+            px_diff = abs((pred_x - gt_x) % 10)
+            py_diff = abs((pred_y - gt_y) % 10)
+            
+            phase_err_x = min(px_diff, 10 - px_diff)
+            phase_err_y = min(py_diff, 10 - py_diff)
+            
+            phase_err = np.sqrt(phase_err_x**2 + phase_err_y**2)
+            phase_errors.append(phase_err)
+            
             times.append((end_time - start_time) / len(batch_items))
             
     avg_error = np.mean(errors)
+    avg_phase_err = np.mean(phase_errors)
     avg_time = np.mean(times)
     
-    success_rate = sum(1 for e in errors if e < 2.0) / len(errors) * 100
+    success_rate = sum(1 for e in phase_errors if e < 2.0) / len(phase_errors) * 100
     
-    print("-" * 30)
-    print(f"Average Error: {avg_error:.3f} px")
-    print(f"Success Rate (<2px err): {success_rate:.1f}%")
+    print("-" * 40)
+    print(f"Absolute Origin Error (Illusion): {avg_error:.3f} px")
+    print(f"Subpixel Phase Error (True Drift): {avg_phase_err:.3f} px")
+    print(f"Success Rate (<2px drift err): {success_rate:.1f}%")
     print(f"Average Inference Time: {avg_time:.3f} s/pair")
 
 if __name__ == '__main__':
