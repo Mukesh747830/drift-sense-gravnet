@@ -33,6 +33,7 @@ def evaluate():
         data = json.load(f)
         
     errors = []
+    phase_errors = []
     times = []
     
     print(f"Evaluating {len(data)} images...")
