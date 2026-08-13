@@ -57,8 +57,15 @@ class GravNet(nn.Module):
         # 3. Apply Spatial Gravity Mask (Center Bias)
         _, _, H, W = heatmap.shape
         log_mask = self.create_spatial_gravity_mask(H, W, W/2, H/2).to(heatmap.device)
-        # ADD the log mask to the logits to correctly suppress the background probabilities!
-        masked_heatmap = heatmap + log_mask.unsqueeze(0).unsqueeze(0)
+        
+        # NORMALIZE the heatmap to [0, 10] so the Gravity Mask can effectively overpower the noise!
+        # Without this, raw logits of 20,000+ completely ignore the subtle mask penalty.
+        heatmap_min = heatmap.amin(dim=(2,3), keepdim=True)
+        heatmap_max = heatmap.amax(dim=(2,3), keepdim=True)
+        heatmap_norm = 10.0 * (heatmap - heatmap_min) / (heatmap_max - heatmap_min + 1e-8)
+        
+        # We multiply the log_mask by 50.0 to make it a strict tie-breaker that strongly isolates the center peak
+        masked_heatmap = heatmap_norm + log_mask.unsqueeze(0).unsqueeze(0) * 50.0
         
         # 4. Soft-Argmax Regression Head
         flat_logits = masked_heatmap.view(B, -1)
