@@ -27,8 +27,9 @@ class GravNet(nn.Module):
         y, x = torch.meshgrid(y, x, indexing='ij')
         
         dist_sq = (x - center_x)**2 + (y - center_y)**2
-        mask = torch.exp(-dist_sq / (2 * sigma**2))
-        return mask
+        # Mathematically add the log of the mask instead of multiplying
+        log_mask = -dist_sq / (2 * sigma**2)
+        return log_mask
 
     def forward(self, ref_img, search_img, return_logits=False):
         # 1. Feature Extraction
@@ -55,22 +56,21 @@ class GravNet(nn.Module):
         
         # 3. Apply Spatial Gravity Mask (Center Bias)
         _, _, H, W = heatmap.shape
-        mask = self.create_spatial_gravity_mask(H, W, W/2, H/2).to(heatmap.device)
-        masked_heatmap = heatmap * mask.unsqueeze(0).unsqueeze(0)
+        log_mask = self.create_spatial_gravity_mask(H, W, W/2, H/2).to(heatmap.device)
+        # ADD the log mask to the logits to correctly suppress the background probabilities!
+        masked_heatmap = heatmap + log_mask.unsqueeze(0).unsqueeze(0)
         
         # 4. Soft-Argmax Regression Head
         flat_logits = masked_heatmap.view(B, -1)
         weights = F.softmax(flat_logits, dim=-1)
         
-        y_grid = torch.linspace(0.0, 1.0, H, device=masked_heatmap.device)
-        x_grid = torch.linspace(0.0, 1.0, W, device=masked_heatmap.device)
+        # Use actual pixel coordinates (0 to W-1) directly to fix the grid scaling bug!
+        y_grid = torch.arange(0, H, dtype=torch.float32, device=masked_heatmap.device)
+        x_grid = torch.arange(0, W, dtype=torch.float32, device=masked_heatmap.device)
         grid_y, grid_x = torch.meshgrid(y_grid, x_grid, indexing='ij')
         
-        pred_x_norm = torch.sum(weights * grid_x.reshape(-1), dim=-1)
-        pred_y_norm = torch.sum(weights * grid_y.reshape(-1), dim=-1)
-        
-        pred_x = pred_x_norm * 1000.0
-        pred_y = pred_y_norm * 1000.0
+        pred_x = torch.sum(weights * grid_x.reshape(-1), dim=-1)
+        pred_y = torch.sum(weights * grid_y.reshape(-1), dim=-1)
         
         coords = torch.stack([pred_x, pred_y], dim=-1)
         
