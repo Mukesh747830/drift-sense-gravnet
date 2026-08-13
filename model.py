@@ -75,6 +75,6 @@ class GravNet(nn.Module):
         coords = torch.stack([pred_x, pred_y], dim=-1)
         
         if return_logits:
-            return coords, flat_logits
+            return coords, heatmap.view(B, -1)
             
         return coords
