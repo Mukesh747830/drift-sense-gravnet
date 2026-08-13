@@ -9,6 +9,7 @@ from torchvision import transforms
 from PIL import Image
 from pathlib import Path
 from tqdm import tqdm
+import numpy as np
 
 from model import GravNet
 
@@ -22,20 +23,9 @@ class DriftSenseDataset(Dataset):
     def __len__(self):
         return len(self.data)
 
-    def create_target_heatmap(self, h, w, gt_y, gt_x, sigma=10.0):
-        # Create a synthesized 2D Gaussian heatmap target for MSE loss
-        y = torch.arange(0, h, dtype=torch.float32)
-        x = torch.arange(0, w, dtype=torch.float32)
-        y, x = torch.meshgrid(y, x, indexing='ij')
-        
-        dist_sq = (x - gt_x)**2 + (y - gt_y)**2
-        heatmap = torch.exp(-dist_sq / (2 * sigma**2))
-        return heatmap
-
     def __getitem__(self, idx):
         item = self.data[idx]
         
-        # Resolve paths relative to json file location
         ref_path = self.json_dir / item['ref_image']
         search_path = self.json_dir / item['search_image']
         
@@ -45,12 +35,15 @@ class DriftSenseDataset(Dataset):
         ref_tensor = self.transform(ref_img)
         search_tensor = self.transform(search_img)
         
-        gt_x = item['gt_x']
-        gt_y = item['gt_y']
+        # Convert raw [0, 1000] pixel coordinates to a flattened 1D index
+        # We clamp to 999 to avoid out-of-bounds index for a 1000x1000 image
+        gt_x = int(np.clip(item['gt_x'], 0, 999))
+        gt_y = int(np.clip(item['gt_y'], 0, 999))
         
-        target_heatmap = self.create_target_heatmap(1000, 1000, gt_y, gt_x)
+        # The flattened index corresponding to (gt_y, gt_x)
+        target_class = gt_y * 1000 + gt_x
         
-        return ref_tensor, search_tensor, target_heatmap.unsqueeze(0)
+        return ref_tensor, search_tensor, target_class
 
 def train():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -58,63 +51,51 @@ def train():
     
     model = GravNet().to(device)
     
-    dataset_path = Path('dataset/labels.json')
-    if not dataset_path.exists():
-        print(f"Error: {dataset_path} not found. Run dataset_generator.py first.")
-        return
-        
-    dataset = DriftSenseDataset(dataset_path)
+    dataset = DriftSenseDataset('dataset/labels.json')
     
-    # OS Multiprocessing safety & optimizations
-    dataloader = DataLoader(
-        dataset, 
-        batch_size=2, 
-        shuffle=True, 
-        num_workers=2, 
-        persistent_workers=True, # Prevents Windows worker re-creation overhead
-        pin_memory=True
-    )
+    # We use batch_size=32 and persistent_workers to speed up training massively
+    dataloader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=2, persistent_workers=True)
     
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
     scaler = torch.amp.GradScaler('cuda')
-    criterion = nn.MSELoss()
     
-    accumulation_steps = 8 # Effective batch size 16
-    epochs = 10
+    # Quick test over 15 epochs
+    epochs = 15
     
+    model.train()
     for epoch in range(epochs):
-        model.train()
         epoch_loss = 0
         optimizer.zero_grad()
         
-        progress_bar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch+1}/{epochs}")
-        
-        for i, (ref, search, target_heatmap) in progress_bar:
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
+        for i, (ref, search, target_class) in enumerate(pbar):
             ref = ref.to(device)
             search = search.to(device)
-            target_heatmap = target_heatmap.to(device)
+            target_class = target_class.to(device)
             
-            # AMP Training to save VRAM
             with torch.amp.autocast('cuda'):
-                pred_heatmap = model(ref, search)
-                loss = criterion(pred_heatmap, target_heatmap)
-                loss = loss / accumulation_steps
+                # We request the raw, un-softmaxed flat logits from model.py
+                _, flat_logits = model(ref, search, return_logits=True)
                 
+                # Spatial Cross Entropy over the 1,000,000 pixels!
+                # This mathematically prohibits the "All-Zeroes Heatmap" shortcut
+                # because the probabilities MUST sum to 1.
+                loss = F.cross_entropy(flat_logits, target_class)
+            
             scaler.scale(loss).backward()
             
-            if (i + 1) % accumulation_steps == 0 or (i + 1) == len(dataloader):
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
                 
-            epoch_loss += loss.item() * accumulation_steps
-            progress_bar.set_postfix({'loss': f"{loss.item() * accumulation_steps:.6f}"})
+            epoch_loss += loss.item()
+            pbar.set_postfix({'loss': f"{loss.item():.4f}"})
             
-        print(f"Epoch {epoch+1} Average Loss: {epoch_loss/len(dataloader):.6f}")
-
-    torch.save(model.state_dict(), 'gravnet_weights.pt')
-    print("Training complete. Weights saved to gravnet_weights.pt")
+        avg_loss = epoch_loss / len(dataloader)
+        print(f"Epoch {epoch+1} Average Loss: {avg_loss:.4f}")
+        
+        torch.save(model.state_dict(), 'gravnet_weights.pt')
+        print("Model weights saved.")
 
 if __name__ == '__main__':
-    # Required for Windows multiprocessing safety
     train()

@@ -2,40 +2,26 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class SimpleConvBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)
-        self.bn = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-        
-    def forward(self, x):
-        return self.relu(self.bn(self.conv(x)))
-
 class FeatureExtractor(nn.Module):
     def __init__(self):
         super().__init__()
-        # Lightweight ResNet-like backbone
-        self.net = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, stride=2, padding=1, bias=False), # 1/2 resolution
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            SimpleConvBlock(16, 16),
-            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1, bias=False), # 1/4 resolution
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            SimpleConvBlock(32, 32)
-        )
+        self.conv1 = nn.Conv2d(1, 16, kernel_size=3, padding=1, stride=2)
+        self.bn1 = nn.BatchNorm2d(16)
         
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1, stride=2)
+        self.bn2 = nn.BatchNorm2d(32)
+
     def forward(self, x):
-        return self.net(x)
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        return x
 
 class GravNet(nn.Module):
     def __init__(self):
         super().__init__()
         self.extractor = FeatureExtractor()
-        
-    def create_spatial_gravity_mask(self, h, w, center_y, center_x, sigma=200):
+
+    def create_spatial_gravity_mask(self, h, w, center_x, center_y, sigma=200.0):
         y = torch.arange(0, h, dtype=torch.float32)
         x = torch.arange(0, w, dtype=torch.float32)
         y, x = torch.meshgrid(y, x, indexing='ij')
@@ -44,39 +30,51 @@ class GravNet(nn.Module):
         mask = torch.exp(-dist_sq / (2 * sigma**2))
         return mask
 
-    def forward(self, ref_img, search_img):
-        # ref_img: [B, 1, 1000, 1000]
-        # search_img: [B, 1, 1000, 1000]
+    def forward(self, ref_img, search_img, return_logits=False):
+        # 1. Feature Extraction
+        ref_shrunk = F.interpolate(ref_img, size=(100, 100), mode='area')
         
-        # STRICT CONSTRAINT: Downsample reference image BEFORE CNN using mode='area'
-        ref_shrunk = F.interpolate(ref_img, size=(100, 100), mode='area') # [B, 1, 100, 100]
+        ref_feat = self.extractor(ref_shrunk)      # -> 25x25
+        search_feat = self.extractor(search_img)   # -> 250x250
         
-        # Extract features
-        ref_feat = self.extractor(ref_shrunk) # [B, 32, 25, 25] (stride 4)
-        search_feat = self.extractor(search_img) # [B, 32, 250, 250] (stride 4)
-        
-        B = ref_feat.shape[0]
+        # 2. Batched Cross-Correlation
+        B = ref_feat.size(0)
         heatmaps = []
-        
-        for i in range(B):
-            # Cross-correlation: slide ref_feat kernel over search_feat
-            kernel = ref_feat[i:i+1] # [1, C, H_r, W_r]
-            feat = search_feat[i:i+1] # [1, C, H_s, W_s]
+        for b in range(B):
+            kernel = ref_feat[b:b+1]
+            feat = search_feat[b:b+1]
             
-            # Use conv2d for cross-correlation
-            # To maintain the center mapping properly, we pad by kernel_size // 2
-            # Here kernel size is 25x25, so padding=12
-            pad = kernel.shape[2] // 2
+            pad = kernel.shape[2] // 2 
             corr = F.conv2d(feat, kernel, padding=pad) 
             heatmaps.append(corr)
             
-        heatmap = torch.cat(heatmaps, dim=0) # [B, 1, 250, 250]
+        heatmap = torch.cat(heatmaps, dim=0)
         
-        # Upsample heatmap to original size (1000x1000)
+        # Interpolate correlation heatmap back to 1000x1000 pixel space
         heatmap = F.interpolate(heatmap, size=(1000, 1000), mode='bilinear', align_corners=False)
         
-        # Apply Spatial Gravity Mask (center 500,500)
-        mask = self.create_spatial_gravity_mask(1000, 1000, 500.0, 500.0).to(heatmap.device)
+        # 3. Apply Spatial Gravity Mask (Center Bias)
+        _, _, H, W = heatmap.shape
+        mask = self.create_spatial_gravity_mask(H, W, W/2, H/2).to(heatmap.device)
         masked_heatmap = heatmap * mask.unsqueeze(0).unsqueeze(0)
         
-        return masked_heatmap
+        # 4. Soft-Argmax Regression Head
+        flat_logits = masked_heatmap.view(B, -1)
+        weights = F.softmax(flat_logits, dim=-1)
+        
+        y_grid = torch.linspace(0.0, 1.0, H, device=masked_heatmap.device)
+        x_grid = torch.linspace(0.0, 1.0, W, device=masked_heatmap.device)
+        grid_y, grid_x = torch.meshgrid(y_grid, x_grid, indexing='ij')
+        
+        pred_x_norm = torch.sum(weights * grid_x.reshape(-1), dim=-1)
+        pred_y_norm = torch.sum(weights * grid_y.reshape(-1), dim=-1)
+        
+        pred_x = pred_x_norm * 1000.0
+        pred_y = pred_y_norm * 1000.0
+        
+        coords = torch.stack([pred_x, pred_y], dim=-1)
+        
+        if return_logits:
+            return coords, flat_logits
+            
+        return coords
