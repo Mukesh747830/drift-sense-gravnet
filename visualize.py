@@ -22,9 +22,13 @@ def visualize_prediction(model_path, search_path, ref_path):
         with torch.amp.autocast('cuda'):
             pred_heatmap = model(ref_tensor, search_tensor).squeeze(1) # [1, 1000, 1000]
         
+        heatmap_min = pred_heatmap.amin(dim=(1,2), keepdim=True)
+        heatmap_max = pred_heatmap.amax(dim=(1,2), keepdim=True)
+        heatmap_norm = 10.0 * (pred_heatmap - heatmap_min) / (heatmap_max - heatmap_min + 1e-8)
+        
         # 1. Macro Tie-Breaker
         dist_sq = create_distance_penalty(1000, 1000, 500, 500, device=device)
-        masked_heatmap = pred_heatmap - dist_sq.unsqueeze(0) * 1.0
+        masked_heatmap = heatmap_norm - dist_sq.unsqueeze(0) * 0.1
         
         flat_idx = masked_heatmap.view(1, -1).argmax(dim=-1).item()
         my = flat_idx // 1000

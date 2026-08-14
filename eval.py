@@ -68,9 +68,15 @@ def evaluate():
             with torch.amp.autocast('cuda'):
                 pred_heatmap = model(ref_batch, search_batch).squeeze(1) # [B, 1000, 1000]
                 
+                # Normalize heatmap to [0, 10] so the extremely large scaled logits from Cross-Entropy 
+                # don't completely ignore the spatial penalty!
+                heatmap_min = pred_heatmap.amin(dim=(1,2), keepdim=True)
+                heatmap_max = pred_heatmap.amax(dim=(1,2), keepdim=True)
+                heatmap_norm = 10.0 * (pred_heatmap - heatmap_min) / (heatmap_max - heatmap_min + 1e-8)
+                
                 # 1. Macro Tie-Breaker: Find the closest valid peak to the center (500, 500).
-                # Subtracting dist_sq directly from raw logits preserves float32 precision flawlessly!
-                masked_heatmap = pred_heatmap - dist_sq.unsqueeze(0) * 1.0
+                # Penalty factor 0.1 guarantees adjacent peaks lose, but allows true peak to beat background.
+                masked_heatmap = heatmap_norm - dist_sq.unsqueeze(0) * 0.1
                 
                 flat_indices = masked_heatmap.view(pred_heatmap.size(0), -1).argmax(dim=-1)
                 macro_y = flat_indices // 1000
