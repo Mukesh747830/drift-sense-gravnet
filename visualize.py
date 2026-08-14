@@ -43,8 +43,8 @@ def visualize_prediction(model_path, search_path, ref_path):
         win_y = win_idx // window.shape[1]
         win_x = win_idx % window.shape[1]
         
-        pred_y = y_start + win_y
-        pred_x = x_start + win_x
+        pred_y = y_start + win_y - 49.5
+        pred_x = x_start + win_x - 49.5
 
     box_size = 100 
     search_cv2 = cv2.cvtColor(np.array(search_img), cv2.COLOR_GRAY2BGR)
