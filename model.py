@@ -8,7 +8,7 @@ class FeatureExtractor(nn.Module):
         self.conv1 = nn.Conv2d(1, 16, kernel_size=3, padding=1, stride=2)
         self.bn1 = nn.BatchNorm2d(16)
         
-        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1, stride=2)
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1, stride=1)
         self.bn2 = nn.BatchNorm2d(32)
 
     def forward(self, x):
@@ -31,13 +31,15 @@ class GravNet(nn.Module):
         # 2. Batched Cross-Correlation
         B = ref_feat.size(0)
         heatmaps = []
-        for b in range(B):
-            kernel = ref_feat[b:b+1]
-            feat = search_feat[b:b+1]
+        for i in range(B):
+            r = ref_feat[i].unsqueeze(0) 
+            s = search_feat[i].unsqueeze(0) 
             
-            pad = kernel.shape[2] // 2 
-            corr = F.conv2d(feat, kernel, padding=pad) 
-            heatmaps.append(corr)
+            # Kernel is 50x50. To get exactly 500x500 output and perfect coordinate alignment,
+            # we must use asymmetric padding (left=25, right=24, top=25, bottom=24).
+            s_padded = F.pad(s, (25, 24, 25, 24))
+            heatmap = F.conv2d(s_padded, r, padding=0)
+            heatmaps.append(heatmap)
             
         heatmap = torch.cat(heatmaps, dim=0)
         
