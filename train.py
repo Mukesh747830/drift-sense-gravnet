@@ -3,7 +3,6 @@ import json
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
@@ -35,15 +34,17 @@ class DriftSenseDataset(Dataset):
         ref_tensor = self.transform(ref_img)
         search_tensor = self.transform(search_img)
         
-        # Convert raw [0, 1000] pixel coordinates to a flattened 1D index
-        # We clamp to 999 to avoid out-of-bounds index for a 1000x1000 image
-        gt_x = int(np.clip(item['gt_x'], 0, 999))
-        gt_y = int(np.clip(item['gt_y'], 0, 999))
+        gt_x = item['gt_x']
+        gt_y = item['gt_y']
         
-        # The flattened index corresponding to (gt_y, gt_x)
-        target_class = gt_y * 1000 + gt_x
-        
-        return ref_tensor, search_tensor, target_class
+        return ref_tensor, search_tensor, torch.tensor([gt_x, gt_y], dtype=torch.float32)
+
+def create_2d_gaussian(h, w, center_x, center_y, sigma=10.0, device='cpu'):
+    y = torch.arange(0, h, dtype=torch.float32, device=device)
+    x = torch.arange(0, w, dtype=torch.float32, device=device)
+    y, x = torch.meshgrid(y, x, indexing='ij')
+    dist_sq = (x - center_x)**2 + (y - center_y)**2
+    return torch.exp(-dist_sq / (2 * sigma**2))
 
 def train():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -52,14 +53,12 @@ def train():
     model = GravNet().to(device)
     
     dataset = DriftSenseDataset('dataset/labels.json')
-    
-    # We use batch_size=32 and persistent_workers to speed up training massively
     dataloader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=2, persistent_workers=True)
     
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
     scaler = torch.amp.GradScaler('cuda')
+    criterion = nn.MSELoss()
     
-    # Quick test over 15 epochs
     epochs = 15
     
     model.train()
@@ -68,19 +67,19 @@ def train():
         optimizer.zero_grad()
         
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
-        for i, (ref, search, target_class) in enumerate(pbar):
+        for i, (ref, search, gt_coords) in enumerate(pbar):
             ref = ref.to(device)
             search = search.to(device)
-            target_class = target_class.to(device)
+            
+            # Generate 2D Gaussian targets on the GPU for speed
+            B = ref.size(0)
+            target_heatmaps = torch.zeros((B, 1000, 1000), device=device)
+            for b in range(B):
+                target_heatmaps[b] = create_2d_gaussian(1000, 1000, gt_coords[b,0], gt_coords[b,1], sigma=10.0, device=device)
             
             with torch.amp.autocast('cuda'):
-                # We request the raw, un-softmaxed flat logits from model.py
-                _, flat_logits = model(ref, search, return_logits=True)
-                
-                # Spatial Cross Entropy over the 1,000,000 pixels!
-                # This mathematically prohibits the "All-Zeroes Heatmap" shortcut
-                # because the probabilities MUST sum to 1.
-                loss = F.cross_entropy(flat_logits, target_class)
+                pred_heatmap = model(ref, search).squeeze(1) # [B, 1000, 1000]
+                loss = criterion(pred_heatmap, target_heatmaps)
             
             scaler.scale(loss).backward()
             
@@ -89,10 +88,10 @@ def train():
             optimizer.zero_grad()
                 
             epoch_loss += loss.item()
-            pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+            pbar.set_postfix({'loss': f"{loss.item():.6f}"})
             
         avg_loss = epoch_loss / len(dataloader)
-        print(f"Epoch {epoch+1} Average Loss: {avg_loss:.4f}")
+        print(f"Epoch {epoch+1} Average Loss: {avg_loss:.6f}")
         
         torch.save(model.state_dict(), 'gravnet_weights.pt')
         print("Model weights saved.")

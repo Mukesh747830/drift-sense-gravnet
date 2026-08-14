@@ -8,6 +8,13 @@ from PIL import Image
 from model import GravNet
 import os
 
+def create_spatial_gravity_mask(h, w, center_x, center_y, sigma=200.0, device='cpu'):
+    y = torch.arange(0, h, dtype=torch.float32, device=device)
+    x = torch.arange(0, w, dtype=torch.float32, device=device)
+    y, x = torch.meshgrid(y, x, indexing='ij')
+    dist_sq = (x - center_x)**2 + (y - center_y)**2
+    return torch.exp(-dist_sq / (2 * sigma**2))
+
 def evaluate():
     json_path = Path('dataset/labels.json')
     if not json_path.exists():
@@ -22,9 +29,6 @@ def evaluate():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = GravNet().to(device)
     model.load_state_dict(torch.load(weights_path, map_location=device))
-    
-    # Run eval with train mode disabled for speed, but remember:
-    # If the network wasn't trained correctly, the batchnorm stats might cause issues.
     model.eval()
     
     transform = transforms.ToTensor()
@@ -38,7 +42,10 @@ def evaluate():
     
     print(f"Evaluating {len(data)} images...")
     
-    batch_size = 2 # Keeping inference batch size small to avoid OOM, adjust if desired
+    # Pre-compute gravity mask for tie-breaking
+    gravity_mask = create_spatial_gravity_mask(1000, 1000, 500, 500, device=device)
+    
+    batch_size = 2
     for i in range(0, len(data), batch_size):
         batch_items = data[i:i+batch_size]
         
@@ -56,19 +63,27 @@ def evaluate():
         start_time = time.time()
         with torch.no_grad():
             with torch.amp.autocast('cuda'):
-                # pred_coords is explicitly in [0.0, 1000.0] range now
-                pred_coords = model(ref_batch, search_batch).cpu().numpy()
+                pred_heatmap = model(ref_batch, search_batch).squeeze(1) # [B, 1000, 1000]
+                
+                # Apply Gravity Mask to heavily penalize identical false peaks far from center
+                masked_heatmap = pred_heatmap * gravity_mask.unsqueeze(0)
+                
+                # Argmax over flattened 1000x1000 map
+                flat_indices = masked_heatmap.view(pred_heatmap.size(0), -1).argmax(dim=-1)
+                
+                pred_y_batch = flat_indices // 1000
+                pred_x_batch = flat_indices % 1000
+                
         end_time = time.time()
         
         for j, item in enumerate(batch_items):
-            # NO NEED to multiply by 1000.0! The model.py already did it.
-            pred_x = pred_coords[j][0] 
-            pred_y = pred_coords[j][1] 
+            pred_x = pred_x_batch[j].item()
+            pred_y = pred_y_batch[j].item()
             
             gt_x = item['gt_x']
             gt_y = item['gt_y']
             
-            # Absolute Error (Misleading on repeating DRAM grid)
+            # Absolute Error
             err = np.sqrt((pred_x - gt_x)**2 + (pred_y - gt_y)**2)
             errors.append(err)
             
