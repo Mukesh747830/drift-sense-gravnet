@@ -2,13 +2,13 @@ import os
 import json
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
 from pathlib import Path
 from tqdm import tqdm
-import numpy as np
 
 from model import GravNet
 
@@ -39,12 +39,17 @@ class DriftSenseDataset(Dataset):
         
         return ref_tensor, search_tensor, torch.tensor([gt_x, gt_y], dtype=torch.float32)
 
-def create_2d_gaussian(h, w, center_x, center_y, sigma=10.0, device='cpu'):
+def create_normalized_2d_gaussian(h, w, center_x, center_y, sigma=2.0, device='cpu'):
+    """
+    Creates a sharply defined 2D Gaussian normalized to sum to 1.0.
+    sigma=2.0 prevents overlap with identical adjacent peaks that are 10 pixels away.
+    """
     y = torch.arange(0, h, dtype=torch.float32, device=device)
     x = torch.arange(0, w, dtype=torch.float32, device=device)
     y, x = torch.meshgrid(y, x, indexing='ij')
     dist_sq = (x - center_x)**2 + (y - center_y)**2
-    return torch.exp(-dist_sq / (2 * sigma**2))
+    gaussian = torch.exp(-dist_sq / (2 * sigma**2))
+    return gaussian / (gaussian.sum() + 1e-8)
 
 def train():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -57,7 +62,6 @@ def train():
     
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
     scaler = torch.amp.GradScaler('cuda')
-    criterion = nn.BCEWithLogitsLoss()
     
     epochs = 15
     
@@ -71,15 +75,18 @@ def train():
             ref = ref.to(device)
             search = search.to(device)
             
-            # Generate 2D Gaussian targets on the GPU for speed
             B = ref.size(0)
-            target_heatmaps = torch.zeros((B, 1000, 1000), device=device)
+            target_heatmaps = torch.zeros((B, 1000*1000), device=device)
             for b in range(B):
-                target_heatmaps[b] = create_2d_gaussian(1000, 1000, gt_coords[b,0], gt_coords[b,1], sigma=10.0, device=device)
+                target_heatmaps[b] = create_normalized_2d_gaussian(
+                    1000, 1000, gt_coords[b,0], gt_coords[b,1], sigma=2.0, device=device
+                ).view(-1)
             
             with torch.amp.autocast('cuda'):
-                pred_heatmap = model(ref, search).squeeze(1) # [B, 1000, 1000]
-                loss = criterion(pred_heatmap, target_heatmaps)
+                # F.cross_entropy with continuous probability targets calculates the optimal KL-Divergence
+                # while natively using log-softmax to completely eliminate exploding logit magnitudes!
+                pred_heatmap = model(ref, search).view(B, -1) 
+                loss = F.cross_entropy(pred_heatmap, target_heatmaps)
             
             scaler.scale(loss).backward()
             

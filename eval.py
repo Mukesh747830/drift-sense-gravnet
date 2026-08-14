@@ -8,12 +8,15 @@ from PIL import Image
 from model import GravNet
 import os
 
-def create_spatial_gravity_mask(h, w, center_x, center_y, sigma=200.0, device='cpu'):
+def create_distance_penalty(h, w, center_x, center_y, device='cpu'):
+    """
+    Creates a quadratic distance penalty map to act as the tie-breaker mask.
+    """
     y = torch.arange(0, h, dtype=torch.float32, device=device)
     x = torch.arange(0, w, dtype=torch.float32, device=device)
     y, x = torch.meshgrid(y, x, indexing='ij')
     dist_sq = (x - center_x)**2 + (y - center_y)**2
-    return torch.exp(-dist_sq / (2 * sigma**2))
+    return dist_sq
 
 def evaluate():
     json_path = Path('dataset/labels.json')
@@ -42,8 +45,8 @@ def evaluate():
     
     print(f"Evaluating {len(data)} images...")
     
-    # Pre-compute gravity mask for tie-breaking
-    gravity_mask = create_spatial_gravity_mask(1000, 1000, 500, 500, device=device)
+    # Pre-compute gravity mask for macro tie-breaking
+    dist_sq = create_distance_penalty(1000, 1000, 500, 500, device=device)
     
     batch_size = 2
     for i in range(0, len(data), batch_size):
@@ -65,21 +68,38 @@ def evaluate():
             with torch.amp.autocast('cuda'):
                 pred_heatmap = model(ref_batch, search_batch).squeeze(1) # [B, 1000, 1000]
                 
-                # Apply Sigmoid to convert raw logits into [0, 1] probabilities,
-                # then apply Gravity Mask to heavily penalize identical false peaks far from center
-                masked_heatmap = torch.sigmoid(pred_heatmap) * gravity_mask.unsqueeze(0)
+                # 1. Macro Tie-Breaker: Find the closest valid peak to the center (500, 500).
+                # Subtracting dist_sq directly from raw logits preserves float32 precision flawlessly!
+                masked_heatmap = pred_heatmap - dist_sq.unsqueeze(0) * 1.0
                 
-                # Argmax over flattened 1000x1000 map
                 flat_indices = masked_heatmap.view(pred_heatmap.size(0), -1).argmax(dim=-1)
+                macro_y = flat_indices // 1000
+                macro_x = flat_indices % 1000
                 
-                pred_y_batch = flat_indices // 1000
-                pred_x_batch = flat_indices % 1000
-                
+                # 2. Micro Subpixel Extractor: The macro tie-breaker slightly shifts the argmax due to the mask.
+                # To get perfect subpixel accuracy, we search a tiny 5x5 window around the macro candidate 
+                # in the purely UNMASKED raw heatmap!
+                pred_y_batch = []
+                pred_x_batch = []
+                for b in range(pred_heatmap.size(0)):
+                    my, mx = macro_y[b].item(), macro_x[b].item()
+                    
+                    y_start, y_end = max(0, my-5), min(1000, my+6)
+                    x_start, x_end = max(0, mx-5), min(1000, mx+6)
+                    
+                    window = pred_heatmap[b, y_start:y_end, x_start:x_end]
+                    win_idx = window.argmax().item()
+                    win_y = win_idx // window.shape[1]
+                    win_x = win_idx % window.shape[1]
+                    
+                    pred_y_batch.append(y_start + win_y)
+                    pred_x_batch.append(x_start + win_x)
+
         end_time = time.time()
         
         for j, item in enumerate(batch_items):
-            pred_x = pred_x_batch[j].item()
-            pred_y = pred_y_batch[j].item()
+            pred_x = pred_x_batch[j]
+            pred_y = pred_y_batch[j]
             
             gt_x = item['gt_x']
             gt_y = item['gt_y']
