@@ -44,5 +44,5 @@ class GravNet(nn.Module):
         # Interpolate correlation heatmap back to 1000x1000 pixel space
         heatmap = F.interpolate(heatmap, size=(1000, 1000), mode='bilinear', align_corners=False)
         
-        # 3. Simply return the raw 2D probability heatmap bounded between [0, 1]
-        return torch.sigmoid(heatmap)
+        # 3. Simply return the raw 2D probability heatmap
+        return heatmap

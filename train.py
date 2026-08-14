@@ -57,7 +57,7 @@ def train():
     
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
     scaler = torch.amp.GradScaler('cuda')
-    criterion = nn.MSELoss()
+    criterion = nn.BCEWithLogitsLoss()
     
     epochs = 15
     

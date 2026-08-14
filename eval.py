@@ -65,8 +65,9 @@ def evaluate():
             with torch.amp.autocast('cuda'):
                 pred_heatmap = model(ref_batch, search_batch).squeeze(1) # [B, 1000, 1000]
                 
-                # Apply Gravity Mask to heavily penalize identical false peaks far from center
-                masked_heatmap = pred_heatmap * gravity_mask.unsqueeze(0)
+                # Apply Sigmoid to convert raw logits into [0, 1] probabilities,
+                # then apply Gravity Mask to heavily penalize identical false peaks far from center
+                masked_heatmap = torch.sigmoid(pred_heatmap) * gravity_mask.unsqueeze(0)
                 
                 # Argmax over flattened 1000x1000 map
                 flat_indices = masked_heatmap.view(pred_heatmap.size(0), -1).argmax(dim=-1)

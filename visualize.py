@@ -27,7 +27,7 @@ def visualize_prediction(model_path, search_path, ref_path):
             pred_heatmap = model(ref_tensor, search_tensor).squeeze(1) # [1, 1000, 1000]
         
         gravity_mask = create_spatial_gravity_mask(1000, 1000, 500, 500, device=device)
-        masked_heatmap = pred_heatmap * gravity_mask.unsqueeze(0)
+        masked_heatmap = torch.sigmoid(pred_heatmap) * gravity_mask.unsqueeze(0)
         
         flat_idx = masked_heatmap.view(1, -1).argmax(dim=-1).item()
         pred_y = flat_idx // 1000
