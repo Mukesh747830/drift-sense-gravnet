@@ -43,7 +43,9 @@ def visualize_prediction(model_path, search_path, ref_path):
         
         pred_y = y_start + win_y - 35.0
         pred_x = x_start + win_x - 35.0
-
+    else:
+        pred_y = macro_y - 35.0
+        pred_x = macro_x - 35.0
     box_size = 100 
     search_cv2 = cv2.cvtColor(np.array(search_img), cv2.COLOR_GRAY2BGR)
     
@@ -56,11 +58,23 @@ def visualize_prediction(model_path, search_path, ref_path):
     plt.title(f"Predicted Center: ({pred_x}, {pred_y})")
     plt.imshow(cv2.cvtColor(search_cv2, cv2.COLOR_BGR2RGB))
     plt.axis('off')
+    
+    # Save the picture so the user can see it!
+    plt.savefig('visualized_output.png', bbox_inches='tight')
     plt.show()
 
+import argparse
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Visualize GravNet Prediction")
+    parser.add_argument("--search", type=str, default="dataset/search/0000.png", help="Path to search image")
+    parser.add_argument("--ref", type=str, default="dataset/reference/0000.png", help="Path to reference image")
+    parser.add_argument("--weights", type=str, default="gravnet_weights.pt", help="Path to model weights")
+    
+    args = parser.parse_args()
+    
     visualize_prediction(
-        model_path="gravnet_weights.pt",
-        search_path="dataset/search/0000.png",
-        ref_path="dataset/reference/0000.png"
+        model_path=args.weights,
+        search_path=args.search,
+        ref_path=args.ref
     )
