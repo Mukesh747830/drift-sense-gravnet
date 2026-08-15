@@ -9,6 +9,7 @@ from torchvision import transforms
 from PIL import Image
 from pathlib import Path
 from tqdm import tqdm
+import random
 
 from model import GravNet
 
@@ -71,24 +72,57 @@ def train():
         optimizer.zero_grad()
         
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
-        for i, (ref, search, gt_coords) in enumerate(pbar):
-            ref = ref.to(device)
-            search = search.to(device)
-            
+        for batch_idx, (ref, search, gt_coords) in enumerate(pbar):
+            ref, search, gt_coords = ref.to(device), search.to(device), gt_coords.to(device)
             B = ref.size(0)
-            target_heatmaps = torch.zeros((B, 1000*1000), device=device)
+            
+            # Crop search_img to 200x200 around gt_coords to make stride=1 training instantaneous
+            search_crops = torch.zeros(B, 1, 200, 200, device=device)
+            target_heatmaps = torch.zeros(B, 171 * 171, device=device)
+            
             for b in range(B):
-                # We crop the reference image by 35 pixels and use padding=7 on a stride=2 feature map.
-                # Mathematically, PyTorch's stride=2 F.conv2d and bilinear interpolation
-                # produces a perfect geometric cross-correlation peak at exactly gt - 0.5 pixels.
-                target_heatmaps[b] = create_normalized_2d_gaussian(
-                    1000, 1000, gt_coords[b,0] - 0.5, gt_coords[b,1] - 0.5, sigma=2.0, device=device
-                ).view(-1)
+                gx, gy = gt_coords[b,0].item(), gt_coords[b,1].item()
+                # Random integer jitter so the target isn't always perfectly centered
+                jx, jy = random.randint(-20, 20), random.randint(-20, 20)
+                sx = int(gx) - 100 + jx
+                sy = int(gy) - 100 + jy
+                
+                # Handle boundaries
+                sx = max(0, min(1000 - 200, sx))
+                sy = max(0, min(1000 - 200, sy))
+                
+                search_crops[b] = search[b, :, sy:sy+200, sx:sx+200]
+                
+                peak_x = gx - sx + 35.0
+                peak_y = gy - sy + 35.0
+                
+                # Vectorized generation of repeating grid of targets (171x171)
+                # The DRAM grid repeats every 10 pixels. 
+                y, x = torch.meshgrid(
+                    torch.arange(171, dtype=torch.float32, device=device),
+                    torch.arange(171, dtype=torch.float32, device=device),
+                    indexing='ij'
+                )
+                
+                dx = torch.arange(-80, 81, 10, dtype=torch.float32, device=device)
+                dy = torch.arange(-80, 81, 10, dtype=torch.float32, device=device)
+                
+                cx = peak_x + dx
+                cy = peak_y + dy
+                
+                # Compute distance squared from all grid peaks [len(cy), len(cx), 171, 171]
+                # Then sum the exp() over the peaks
+                # Since the peaks are far apart, summing probabilities is valid.
+                dist_sq = (x.unsqueeze(0).unsqueeze(0) - cx.unsqueeze(1).unsqueeze(2).unsqueeze(3))**2 + \
+                          (y.unsqueeze(0).unsqueeze(0) - cy.unsqueeze(0).unsqueeze(2).unsqueeze(3))**2
+                          
+                target = torch.exp(-dist_sq / (2.0 * 2.0**2)).sum(dim=(0, 1))
+                target = target / target.sum()
+                target_heatmaps[b] = target.view(-1)
             
             with torch.amp.autocast('cuda'):
-                # F.cross_entropy with continuous probability targets calculates the optimal KL-Divergence
-                # while natively using log-softmax to completely eliminate exploding logit magnitudes!
-                pred_heatmap = model(ref, search).view(B, -1) 
+                pred_heatmap = model(ref, search_crops)
+                pred_heatmap = pred_heatmap.reshape(B, -1)
                 loss = F.cross_entropy(pred_heatmap, target_heatmaps)
             
             scaler.scale(loss).backward()

@@ -20,31 +20,29 @@ def visualize_prediction(model_path, search_path, ref_path):
 
     with torch.no_grad():
         with torch.amp.autocast('cuda'):
-            pred_heatmap = model(ref_tensor, search_tensor).squeeze(1) # [1, 1000, 1000]
-        
-        heatmap_min = pred_heatmap.amin(dim=(1,2), keepdim=True)
-        heatmap_max = pred_heatmap.amax(dim=(1,2), keepdim=True)
-        heatmap_norm = 10.0 * (pred_heatmap - heatmap_min) / (heatmap_max - heatmap_min + 1e-8)
-        
-        # 1. Macro Tie-Breaker
-        dist_sq = create_distance_penalty(1000, 1000, 500, 500, device=device)
-        masked_heatmap = heatmap_norm - dist_sq.unsqueeze(0) * 0.1
-        
-        flat_idx = masked_heatmap.view(1, -1).argmax(dim=-1).item()
-        my = flat_idx // 1000
-        mx = flat_idx % 1000
-        
-        # 2. Micro Subpixel Extractor (Unmasked)
-        y_start, y_end = max(0, my-5), min(1000, my+6)
-        x_start, x_end = max(0, mx-5), min(1000, mx+6)
-        
-        window = pred_heatmap[0, y_start:y_end, x_start:x_end]
-        win_idx = window.argmax().item()
+            heatmap = model(ref_tensor, search_tensor).squeeze() # 971x971
+            
+    heatmap_np = heatmap.cpu().numpy()
+    
+    # 971x971 center is 485
+    dist_sq = create_distance_penalty(971, 971, 485, 485, device=device)
+    masked_heatmap = heatmap - dist_sq * 0.1
+    
+    macro_idx = masked_heatmap.view(-1).argmax().item()
+    macro_y = macro_idx // 971
+    macro_x = macro_idx % 971
+    
+    y_start, y_end = max(0, macro_y - 5), min(971, macro_y + 6)
+    x_start, x_end = max(0, macro_x - 5), min(971, macro_x + 6)
+    
+    if (y_end - y_start) == 11 and (x_end - x_start) == 11:
+        window = heatmap_np[y_start:y_end, x_start:x_end]
+        win_idx = window.argmax()
         win_y = win_idx // window.shape[1]
         win_x = win_idx % window.shape[1]
         
-        pred_y = y_start + win_y + 0.5
-        pred_x = x_start + win_x + 0.5
+        pred_y = y_start + win_y - 35.0
+        pred_x = x_start + win_x - 35.0
 
     box_size = 100 
     search_cv2 = cv2.cvtColor(np.array(search_img), cv2.COLOR_GRAY2BGR)

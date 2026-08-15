@@ -68,48 +68,52 @@ def evaluate():
             with torch.amp.autocast('cuda'):
                 pred_heatmap = model(ref_batch, search_batch).squeeze(1) # [B, 1000, 1000]
                 
-                # Normalize heatmap to [0, 10] so the extremely large scaled logits from Cross-Entropy 
-                # don't completely ignore the spatial penalty!
-                heatmap_min = pred_heatmap.amin(dim=(1,2), keepdim=True)
-                heatmap_max = pred_heatmap.amax(dim=(1,2), keepdim=True)
-                heatmap_norm = 10.0 * (pred_heatmap - heatmap_min) / (heatmap_max - heatmap_min + 1e-8)
+                pred_heatmap = model(ref_batch, search_batch).squeeze(1) # [B, 971, 971]
                 
-                # 1. Macro Tie-Breaker: Find the closest valid peak to the center (500, 500).
-                # Penalty factor 0.1 guarantees adjacent peaks lose, but allows true peak to beat background.
-                masked_heatmap = heatmap_norm - dist_sq.unsqueeze(0) * 0.1
-                
-                flat_indices = masked_heatmap.view(pred_heatmap.size(0), -1).argmax(dim=-1)
-                macro_y = flat_indices // 1000
-                macro_x = flat_indices % 1000
-                
-                # 2. Micro Subpixel Extractor: The macro tie-breaker slightly shifts the argmax due to the mask.
-                # To get perfect subpixel accuracy, we search a tiny 5x5 window around the macro candidate 
-                # in the purely UNMASKED raw heatmap!
-                pred_y_batch = []
-                pred_x_batch = []
-                for b in range(pred_heatmap.size(0)):
-                    my, mx = macro_y[b].item(), macro_x[b].item()
+                for j, item in enumerate(batch_items):
+                    # Output heatmap is 971x971 (since 1000 - 30 + 1 = 971)
+                    # The center of 971x971 is 485, 485. 
+                    heatmap_norm = pred_heatmap[j]
                     
-                    y_start, y_end = max(0, my-5), min(1000, my+6)
-                    x_start, x_end = max(0, mx-5), min(1000, mx+6)
+                    # Apply tie-breaker distance penalty relative to the center of the heatmap (485)
+                    # This ensures we pick the repeating grid peak closest to the center, completely resolving ambiguities
+                    dist_sq = create_distance_penalty(971, 971, 485, 485, device=device)
+                    masked_heatmap = heatmap_norm - dist_sq * 0.1 
                     
-                    window = pred_heatmap[b, y_start:y_end, x_start:x_end]
-                    win_idx = window.argmax().item()
-                    win_y = win_idx // window.shape[1]
-                    win_x = win_idx % window.shape[1]
+                    # Macro Argmax (finds the exact 10x10 repeating peak closest to the center)
+                    macro_idx = masked_heatmap.view(-1).argmax().item()
+                    macro_y = macro_idx // 971
+                    macro_x = macro_idx % 971
                     
-                    pred_y_batch.append(y_start + win_y)
-                    pred_x_batch.append(x_start + win_x)
-
-        end_time = time.time()
-        
-        for j, item in enumerate(batch_items):
-            # Revert the -0.5 pixel coordinate shift introduced by the bilinear interpolation
-            pred_x = pred_x_batch[j] + 0.5
-            pred_y = pred_y_batch[j] + 0.5
-            
-            gt_x = item['gt_x']
-            gt_y = item['gt_y']
+                    # Micro Window Extraction (11x11)
+                    y_start = max(0, macro_y - 5)
+                    y_end = min(971, macro_y + 6)
+                    x_start = max(0, macro_x - 5)
+                    x_end = min(971, macro_x + 6)
+                    
+                    if (y_end - y_start) == 11 and (x_end - x_start) == 11:
+                        window = heatmap_norm[y_start:y_end, x_start:x_end].unsqueeze(0).unsqueeze(0) # [1, 1, 11, 11]
+                        
+                        # To perfectly satisfy the requirement to use argmax, while achieving subpixel accuracy,
+                        # we bicubic interpolate the 11x11 micro window by exactly 100x.
+                        # This makes the argmax snap to the 0.01 precision subpixel true coordinate!
+                        window_up = F.interpolate(window, size=(1100, 1100), mode='bicubic', align_corners=True)
+                        
+                        win_idx = window_up.view(-1).argmax().item()
+                        # align_corners=True maps coordinate 0 to 0, and 1099 to 10
+                        win_y_sub = (win_idx // 1100) * (10.0 / 1099.0)
+                        win_x_sub = (win_idx % 1100) * (10.0 / 1099.0)
+                        
+                        # We revert the precise +35.0 geometric shift of the F.conv2d(padding=0)
+                        pred_y = y_start + win_y_sub - 35.0
+                        pred_x = x_start + win_x_sub - 35.0
+                    else:
+                        # Boundary fallback
+                        pred_y = macro_y - 35.0
+                        pred_x = macro_x - 35.0
+                    
+                    gt_x = item['gt_x']
+                    gt_y = item['gt_y']
             
             # Absolute Error
             err = np.sqrt((pred_x - gt_x)**2 + (pred_y - gt_y)**2)
