@@ -82,7 +82,7 @@ def train():
                 # Mathematically, this produces a perfect geometric cross-correlation shift of exactly +49.5 pixels 
                 # in the 1000x1000 output heatmap relative to the top-left ground truth target.
                 target_heatmaps[b] = create_normalized_2d_gaussian(
-                    1000, 1000, gt_coords[b,0] + 49.5, gt_coords[b,1] + 49.5, sigma=2.0, device=device
+                    1000, 1000, gt_coords[b,0] + 50.0, gt_coords[b,1] + 50.0, sigma=2.0, device=device
                 ).view(-1)
             
             with torch.amp.autocast('cuda'):

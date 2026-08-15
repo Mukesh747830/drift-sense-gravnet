@@ -104,9 +104,9 @@ def evaluate():
         end_time = time.time()
         
         for j, item in enumerate(batch_items):
-            # Subtract the 49.5 mathematical geometric shift from the cross-correlation
-            pred_x = pred_x_batch[j] - 49.5
-            pred_y = pred_y_batch[j] - 49.5
+            # Subtract the 50.0 mathematical geometric shift from the cross-correlation
+            pred_x = pred_x_batch[j] - 50.0
+            pred_y = pred_y_batch[j] - 50.0
             
             gt_x = item['gt_x']
             gt_y = item['gt_y']
