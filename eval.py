@@ -104,9 +104,9 @@ def evaluate():
         end_time = time.time()
         
         for j, item in enumerate(batch_items):
-            # Subtract the 50.0 mathematical geometric shift from the cross-correlation
-            pred_x = pred_x_batch[j] - 50.0
-            pred_y = pred_y_batch[j] - 50.0
+            # Revert the -0.5 pixel coordinate shift introduced by the bilinear interpolation
+            pred_x = pred_x_batch[j] + 0.5
+            pred_y = pred_y_batch[j] + 0.5
             
             gt_x = item['gt_x']
             gt_y = item['gt_y']

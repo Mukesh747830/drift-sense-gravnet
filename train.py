@@ -79,10 +79,10 @@ def train():
             target_heatmaps = torch.zeros((B, 1000*1000), device=device)
             for b in range(B):
                 # We crop the reference image by 35 pixels and use padding=7 on a stride=2 feature map.
-                # Mathematically, this produces a perfect geometric cross-correlation shift of exactly +49.5 pixels 
-                # in the 1000x1000 output heatmap relative to the top-left ground truth target.
+                # Mathematically, PyTorch's stride=2 F.conv2d and bilinear interpolation
+                # produces a perfect geometric cross-correlation peak at exactly gt - 0.5 pixels.
                 target_heatmaps[b] = create_normalized_2d_gaussian(
-                    1000, 1000, gt_coords[b,0] + 50.0, gt_coords[b,1] + 50.0, sigma=2.0, device=device
+                    1000, 1000, gt_coords[b,0] - 0.5, gt_coords[b,1] - 0.5, sigma=2.0, device=device
                 ).view(-1)
             
             with torch.amp.autocast('cuda'):
