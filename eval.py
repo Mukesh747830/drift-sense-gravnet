@@ -1,6 +1,7 @@
 import json
 import time
 import torch
+import torch.nn.functional as F
 import numpy as np
 from pathlib import Path
 from torchvision import transforms
@@ -111,25 +112,26 @@ def evaluate():
                         # Boundary fallback
                         pred_y = macro_y - 35.0
                         pred_x = macro_x - 35.0
-                    
+                        
                     gt_x = item['gt_x']
                     gt_y = item['gt_y']
             
-            # Absolute Error
-            err = np.sqrt((pred_x - gt_x)**2 + (pred_y - gt_y)**2)
-            errors.append(err)
-            
-            # Subpixel Phase Error: The TRUE metric for repeating structures!
-            px_diff = abs((pred_x - gt_x) % 10)
-            py_diff = abs((pred_y - gt_y) % 10)
-            
-            phase_err_x = min(px_diff, 10 - px_diff)
-            phase_err_y = min(py_diff, 10 - py_diff)
-            
-            phase_err = np.sqrt(phase_err_x**2 + phase_err_y**2)
-            phase_errors.append(phase_err)
-            
-            times.append((end_time - start_time) / len(batch_items))
+                    # Absolute Error
+                    err = np.sqrt((pred_x - gt_x)**2 + (pred_y - gt_y)**2)
+                    errors.append(err)
+                    
+                    # Subpixel Phase Error: The TRUE metric for repeating structures!
+                    px_diff = abs((pred_x - gt_x) % 10)
+                    py_diff = abs((pred_y - gt_y) % 10)
+                    
+                    phase_err_x = min(px_diff, 10 - px_diff)
+                    phase_err_y = min(py_diff, 10 - py_diff)
+                    
+                    phase_err = np.sqrt(phase_err_x**2 + phase_err_y**2)
+                    phase_errors.append(phase_err)
+                    
+                end_time = time.time()
+                times.append((end_time - start_time) / len(batch_items))
             
     avg_error = np.mean(errors)
     avg_phase_err = np.mean(phase_errors)
