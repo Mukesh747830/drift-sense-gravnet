@@ -1,13 +1,11 @@
 """
 model.py — Fully Convolutional Siamese Network with 2D Spatial Heatmap Output
 
-Architecture:
-  1. Shared CNN backbone extracts dense features from both images.
-  2. Reference features are cross-correlated against search features.
-  3. A convolutional head refines the correlation map into a 2D probability heatmap.
-
-The model outputs a spatial heatmap (not raw coordinates), eliminating the
-mode-collapse problem caused by coordinate regression on repeating patterns.
+Memory-optimized for RTX 5050 (8GB VRAM):
+  - Images are downscaled to 256x256 internally before the backbone
+  - Lightweight 2-stage backbone (stride 4) → 64x64 heatmap
+  - Depth-wise cross-correlation for template matching
+  - Output: [B, 1, 64, 64] spatial logits
 """
 
 import torch
@@ -16,7 +14,7 @@ import torch.nn.functional as F
 
 
 class ConvBlock(nn.Module):
-    """Conv → BatchNorm → ReLU block."""
+    """Conv → BatchNorm → ReLU."""
     def __init__(self, in_ch, out_ch, kernel_size=3, stride=1, padding=1):
         super().__init__()
         self.conv = nn.Conv2d(in_ch, out_ch, kernel_size, stride, padding, bias=False)
@@ -29,32 +27,26 @@ class ConvBlock(nn.Module):
 
 class Backbone(nn.Module):
     """
-    Lightweight VGG-style backbone that extracts multi-scale features.
-    Input:  [B, 1, H, W]
-    Output: [B, 128, H/8, W/8]  (dense feature map, stride 8)
+    Lightweight backbone. Stride 4 total.
+    Input:  [B, 1, 256, 256]
+    Output: [B, 64, 64, 64]
     """
     def __init__(self):
         super().__init__()
         self.layer1 = nn.Sequential(
-            ConvBlock(1, 32, 3, 1, 1),
-            ConvBlock(32, 32, 3, 1, 1),
-            nn.MaxPool2d(2, 2),  # /2
+            ConvBlock(1, 16, 3, 1, 1),
+            ConvBlock(16, 16, 3, 1, 1),
+            nn.MaxPool2d(2, 2),           # 256 → 128
         )
         self.layer2 = nn.Sequential(
+            ConvBlock(16, 32, 3, 1, 1),
             ConvBlock(32, 64, 3, 1, 1),
-            ConvBlock(64, 64, 3, 1, 1),
-            nn.MaxPool2d(2, 2),  # /4
-        )
-        self.layer3 = nn.Sequential(
-            ConvBlock(64, 128, 3, 1, 1),
-            ConvBlock(128, 128, 3, 1, 1),
-            nn.MaxPool2d(2, 2),  # /8
+            nn.MaxPool2d(2, 2),           # 128 → 64
         )
 
     def forward(self, x):
         x = self.layer1(x)
         x = self.layer2(x)
-        x = self.layer3(x)
         return x
 
 
@@ -63,72 +55,78 @@ class DriftSenseNet(nn.Module):
     Fully Convolutional Siamese Network.
 
     Pipeline:
-      1. Backbone extracts features from search image (1000x1000 → 125x125)
-      2. Backbone extracts features from reference image (1000x1000 → 125x125)
-      3. Reference is adaptive-avg-pooled to a small kernel
-      4. Depth-wise cross-correlation produces a raw correlation map
-      5. A convolutional head refines into a 2D spatial heatmap (125x125)
+      1. Both images downscaled to 256x256 (saves VRAM)
+      2. Shared backbone extracts 64-ch features at stride 4 → 64x64
+      3. Reference features pooled to 5x5 kernel
+      4. Depth-wise cross-correlation → raw correlation map
+      5. Refinement head → [B, 1, 64, 64] spatial heatmap logits
 
-    Output: [B, 1, 125, 125] heatmap (logits for spatial cross-entropy)
+    Ground truth mapping:
+      heatmap pixel (hx, hy) corresponds to image pixel (hx * 15.625, hy * 15.625)
     """
-    HEATMAP_SIZE = 125  # 1000 / 8 = 125
+    HEATMAP_SIZE = 64    # 256 / 4 = 64
+    INTERNAL_RES = 256   # images downscaled to this before backbone
 
     def __init__(self):
         super().__init__()
         self.backbone = Backbone()
 
-        # Squeeze the reference features into a compact kernel
-        self.ref_pool = nn.AdaptiveAvgPool2d((7, 7))
+        # Pool reference features to a compact correlation kernel
+        self.ref_pool = nn.AdaptiveAvgPool2d((5, 5))
 
-        # Project ref features into a single "template" channel for correlation
+        # 1x1 projections to align feature spaces
         self.ref_proj = nn.Sequential(
-            nn.Conv2d(128, 64, 1, bias=False),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(64, 32, 1, bias=False),
+            nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
         )
         self.search_proj = nn.Sequential(
-            nn.Conv2d(128, 64, 1, bias=False),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(64, 32, 1, bias=False),
+            nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
         )
 
-        # Refinement head: takes correlation map and produces final heatmap
+        # Refinement head: correlation map → final heatmap logits
         self.head = nn.Sequential(
-            ConvBlock(1, 32, 3, 1, 1),
-            ConvBlock(32, 16, 3, 1, 1),
-            nn.Conv2d(16, 1, 1, bias=True),  # Final 1x1 conv → logits
+            ConvBlock(1, 16, 3, 1, 1),
+            ConvBlock(16, 8, 3, 1, 1),
+            nn.Conv2d(8, 1, 1, bias=True),
         )
 
     def forward(self, ref_img, search_img):
         """
         Args:
-            ref_img:    [B, 1, 1000, 1000]
-            search_img: [B, 1, 1000, 1000]
+            ref_img:    [B, 1, H, W]  (any size, will be resized)
+            search_img: [B, 1, H, W]  (any size, will be resized)
         Returns:
-            heatmap:    [B, 1, 125, 125] — spatial logits
+            heatmap:    [B, 1, 64, 64] spatial logits
         """
-        # Extract features
-        search_feat = self.search_proj(self.backbone(search_img))  # [B, 64, 125, 125]
-        ref_feat = self.ref_proj(self.backbone(ref_img))            # [B, 64, 125, 125]
+        R = self.INTERNAL_RES
+
+        # Downscale to 256x256 to fit in VRAM
+        ref = F.interpolate(ref_img, size=(R, R), mode='bilinear', align_corners=False)
+        search = F.interpolate(search_img, size=(R, R), mode='bilinear', align_corners=False)
+
+        # Extract features through shared backbone
+        search_feat = self.search_proj(self.backbone(search))   # [B, 32, 64, 64]
+        ref_feat = self.ref_proj(self.backbone(ref))            # [B, 32, 64, 64]
 
         # Pool reference to compact kernel
-        ref_kernel = self.ref_pool(ref_feat)  # [B, 64, 7, 7]
+        ref_kernel = self.ref_pool(ref_feat)  # [B, 32, 5, 5]
 
-        # Depth-wise cross-correlation (per-batch element)
+        # Depth-wise cross-correlation (per batch element)
         B = search_feat.size(0)
         corr_maps = []
         for i in range(B):
-            # F.conv2d with padding='same' to keep spatial dims
-            s = search_feat[i:i + 1]          # [1, 64, 125, 125]
-            k = ref_kernel[i:i + 1]           # [1, 64, 7, 7]
-            # Group convolution: each of the 64 channels correlates independently
-            corr = F.conv2d(s, k, padding=3, groups=64)  # [1, 64, 125, 125]
-            corr = corr.mean(dim=1, keepdim=True)         # [1, 1, 125, 125]
+            s = search_feat[i:i + 1]           # [1, 32, 64, 64]
+            k = ref_kernel[i:i + 1]            # [1, 32, 5, 5]
+            corr = F.conv2d(s, k, padding=2, groups=32)  # [1, 32, 64, 64]
+            corr = corr.mean(dim=1, keepdim=True)         # [1, 1, 64, 64]
             corr_maps.append(corr)
 
-        corr_map = torch.cat(corr_maps, dim=0)  # [B, 1, 125, 125]
+        corr_map = torch.cat(corr_maps, dim=0)  # [B, 1, 64, 64]
 
-        # Refine correlation map into final heatmap logits
-        heatmap = self.head(corr_map)  # [B, 1, 125, 125]
+        # Refine into final heatmap
+        heatmap = self.head(corr_map)  # [B, 1, 64, 64]
 
         return heatmap

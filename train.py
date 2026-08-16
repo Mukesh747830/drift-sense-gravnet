@@ -1,16 +1,14 @@
 """
 train.py — Heatmap Training with Spatial Cross-Entropy Loss
 
-Converts raw (gt_x, gt_y) coordinates from labels.json into 2D Gaussian
-target heatmaps. Uses spatial cross-entropy loss for robust training on
-repeating structures.
+Converts raw (gt_x, gt_y) from labels.json into 2D Gaussian target heatmaps.
+Uses spatial cross-entropy loss for robust training on repeating structures.
 
-Optimized for RTX 5050: batch_size=32, epochs=15, mixed precision.
+Optimized for RTX 5050 (8GB VRAM): batch_size=16, epochs=15, mixed precision.
 """
 
 import json
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
@@ -23,12 +21,12 @@ from model import DriftSenseNet
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Constants — must match model.py exactly
+# Constants — derived from model.py
 # ──────────────────────────────────────────────────────────────────────
-HEATMAP_SIZE = DriftSenseNet.HEATMAP_SIZE  # 125
+HEATMAP_SIZE = DriftSenseNet.HEATMAP_SIZE  # 64
 IMG_SIZE = 1000
-SCALE_FACTOR = IMG_SIZE / HEATMAP_SIZE     # 8.0
-GAUSSIAN_SIGMA = 2.0                       # in heatmap pixels
+SCALE_FACTOR = IMG_SIZE / HEATMAP_SIZE     # 15.625
+GAUSSIAN_SIGMA = 1.5                       # in heatmap pixels
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -71,8 +69,8 @@ class DriftSenseDataset(Dataset):
     @staticmethod
     def _make_gaussian_heatmap(cx, cy):
         """
-        Creates a [HEATMAP_SIZE, HEATMAP_SIZE] Gaussian heatmap centered at (cx, cy).
-        Normalized to sum to 1.0 for use as a probability distribution with cross-entropy.
+        Creates a [HEATMAP_SIZE x HEATMAP_SIZE] Gaussian heatmap centered at (cx, cy).
+        Normalized to sum to 1.0 for use as a probability distribution.
         """
         y = torch.arange(0, HEATMAP_SIZE, dtype=torch.float32)
         x = torch.arange(0, HEATMAP_SIZE, dtype=torch.float32)
@@ -83,8 +81,7 @@ class DriftSenseDataset(Dataset):
 
         # Normalize to probability distribution
         gaussian = gaussian / (gaussian.sum() + 1e-8)
-
-        return gaussian  # [125, 125]
+        return gaussian  # [64, 64]
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -101,7 +98,7 @@ def train():
     dataset = DriftSenseDataset('dataset/labels.json')
     dataloader = DataLoader(
         dataset,
-        batch_size=32,
+        batch_size=16,
         shuffle=True,
         num_workers=4,
         pin_memory=True,
@@ -116,8 +113,7 @@ def train():
     epochs = 15
 
     print(f"\nStarting training: {epochs} epochs, {len(dataloader)} batches/epoch")
-    print(f"Heatmap size: {HEATMAP_SIZE}x{HEATMAP_SIZE}, "
-          f"Scale factor: {SCALE_FACTOR:.1f}x\n")
+    print(f"Heatmap: {HEATMAP_SIZE}x{HEATMAP_SIZE}, Scale: {SCALE_FACTOR:.3f}x\n")
 
     model.train()
     for epoch in range(epochs):
@@ -132,15 +128,12 @@ def train():
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast('cuda'):
-                # Forward pass: model outputs [B, 1, 125, 125]
+                # Forward: model outputs [B, 1, 64, 64]
                 pred_heatmap = model(ref, search)
 
-                # Reshape for spatial cross-entropy:
-                # pred:   [B, 125*125] (logits)
-                # target: [B, 125*125] (soft probability distribution)
                 B = pred_heatmap.size(0)
-                pred_flat = pred_heatmap.reshape(B, -1)         # [B, 15625]
-                target_flat = target_heatmap.reshape(B, -1)     # [B, 15625]
+                pred_flat = pred_heatmap.reshape(B, -1)      # [B, 4096]
+                target_flat = target_heatmap.reshape(B, -1)   # [B, 4096]
 
                 # Spatial cross-entropy: -sum(target * log_softmax(pred))
                 log_pred = F.log_softmax(pred_flat, dim=1)
@@ -159,7 +152,6 @@ def train():
         lr = optimizer.param_groups[0]['lr']
         print(f"Epoch {epoch + 1} — Avg Loss: {avg_loss:.4f}, LR: {lr:.6f}")
 
-        # Save weights after every epoch
         torch.save(model.state_dict(), 'gravnet_weights.pt')
         print("Weights saved.\n")
 
