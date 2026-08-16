@@ -119,7 +119,8 @@ class DriftSenseNet(nn.Module):
         corr_maps = []
         for i in range(B):
             s = search_feat[i:i + 1]           # [1, 32, 64, 64]
-            k = ref_kernel[i:i + 1]            # [1, 32, 5, 5]
+            k = ref_kernel[i]                  # [32, 5, 5]
+            k = k.unsqueeze(1)                 # [32, 1, 5, 5] — correct shape for groups=32
             corr = F.conv2d(s, k, padding=2, groups=32)  # [1, 32, 64, 64]
             corr = corr.mean(dim=1, keepdim=True)         # [1, 1, 64, 64]
             corr_maps.append(corr)
