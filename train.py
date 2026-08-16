@@ -1,4 +1,13 @@
-import os
+"""
+train.py — Heatmap Training with Spatial Cross-Entropy Loss
+
+Converts raw (gt_x, gt_y) coordinates from labels.json into 2D Gaussian
+target heatmaps. Uses spatial cross-entropy loss for robust training on
+repeating structures.
+
+Optimized for RTX 5050: batch_size=32, epochs=15, mixed precision.
+"""
+
 import json
 import torch
 import torch.nn as nn
@@ -9,10 +18,22 @@ from torchvision import transforms
 from PIL import Image
 from pathlib import Path
 from tqdm import tqdm
-import random
 
-from model import GravNet
+from model import DriftSenseNet
 
+
+# ──────────────────────────────────────────────────────────────────────
+# Constants — must match model.py exactly
+# ──────────────────────────────────────────────────────────────────────
+HEATMAP_SIZE = DriftSenseNet.HEATMAP_SIZE  # 125
+IMG_SIZE = 1000
+SCALE_FACTOR = IMG_SIZE / HEATMAP_SIZE     # 8.0
+GAUSSIAN_SIGMA = 2.0                       # in heatmap pixels
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Dataset
+# ──────────────────────────────────────────────────────────────────────
 class DriftSenseDataset(Dataset):
     def __init__(self, json_path):
         with open(json_path, 'r') as f:
@@ -25,120 +46,125 @@ class DriftSenseDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.data[idx]
-        
+
         ref_path = self.json_dir / item['ref_image']
         search_path = self.json_dir / item['search_image']
-        
+
         ref_img = Image.open(ref_path).convert('L')
         search_img = Image.open(search_path).convert('L')
-        
-        ref_tensor = self.transform(ref_img)
-        search_tensor = self.transform(search_img)
-        
+
+        ref_tensor = self.transform(ref_img)       # [1, 1000, 1000]
+        search_tensor = self.transform(search_img)  # [1, 1000, 1000]
+
         gt_x = item['gt_x']
         gt_y = item['gt_y']
-        
-        return ref_tensor, search_tensor, torch.tensor([gt_x, gt_y], dtype=torch.float32)
 
-def create_normalized_2d_gaussian(h, w, center_x, center_y, sigma=2.0, device='cpu'):
-    """
-    Creates a sharply defined 2D Gaussian normalized to sum to 1.0.
-    sigma=2.0 prevents overlap with identical adjacent peaks that are 10 pixels away.
-    """
-    y = torch.arange(0, h, dtype=torch.float32, device=device)
-    x = torch.arange(0, w, dtype=torch.float32, device=device)
-    y, x = torch.meshgrid(y, x, indexing='ij')
-    dist_sq = (x - center_x)**2 + (y - center_y)**2
-    gaussian = torch.exp(-dist_sq / (2 * sigma**2))
-    return gaussian / (gaussian.sum() + 1e-8)
+        # Convert ground truth from 1000x1000 coords to heatmap coords
+        hm_x = gt_x / SCALE_FACTOR
+        hm_y = gt_y / SCALE_FACTOR
 
+        # Generate 2D Gaussian target heatmap
+        target_heatmap = self._make_gaussian_heatmap(hm_x, hm_y)
+
+        return ref_tensor, search_tensor, target_heatmap
+
+    @staticmethod
+    def _make_gaussian_heatmap(cx, cy):
+        """
+        Creates a [HEATMAP_SIZE, HEATMAP_SIZE] Gaussian heatmap centered at (cx, cy).
+        Normalized to sum to 1.0 for use as a probability distribution with cross-entropy.
+        """
+        y = torch.arange(0, HEATMAP_SIZE, dtype=torch.float32)
+        x = torch.arange(0, HEATMAP_SIZE, dtype=torch.float32)
+        yy, xx = torch.meshgrid(y, x, indexing='ij')
+
+        dist_sq = (xx - cx) ** 2 + (yy - cy) ** 2
+        gaussian = torch.exp(-dist_sq / (2.0 * GAUSSIAN_SIGMA ** 2))
+
+        # Normalize to probability distribution
+        gaussian = gaussian / (gaussian.sum() + 1e-8)
+
+        return gaussian  # [125, 125]
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Training
+# ──────────────────────────────────────────────────────────────────────
 def train():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Training on device: {device}")
-    
-    model = GravNet().to(device)
-    
+
+    model = DriftSenseNet().to(device)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Model parameters: {total_params:,}")
+
     dataset = DriftSenseDataset('dataset/labels.json')
-    dataloader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=2, persistent_workers=True)
-    
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=32,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
+        drop_last=True,
+    )
+
+    optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=15)
     scaler = torch.amp.GradScaler('cuda')
-    
+
     epochs = 15
-    
+
+    print(f"\nStarting training: {epochs} epochs, {len(dataloader)} batches/epoch")
+    print(f"Heatmap size: {HEATMAP_SIZE}x{HEATMAP_SIZE}, "
+          f"Scale factor: {SCALE_FACTOR:.1f}x\n")
+
     model.train()
     for epoch in range(epochs):
-        epoch_loss = 0
-        optimizer.zero_grad()
-        
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
-        for batch_idx, (ref, search, gt_coords) in enumerate(pbar):
-            ref, search, gt_coords = ref.to(device), search.to(device), gt_coords.to(device)
-            B = ref.size(0)
-            
-            # Crop search_img to 200x200 around gt_coords to make stride=1 training instantaneous
-            search_crops = torch.zeros(B, 1, 200, 200, device=device)
-            target_heatmaps = torch.zeros(B, 171 * 171, device=device)
-            
-            for b in range(B):
-                gx, gy = gt_coords[b,0].item(), gt_coords[b,1].item()
-                # Random integer jitter so the target isn't always perfectly centered
-                jx, jy = random.randint(-20, 20), random.randint(-20, 20)
-                sx = int(gx) - 100 + jx
-                sy = int(gy) - 100 + jy
-                
-                # Handle boundaries
-                sx = max(0, min(1000 - 200, sx))
-                sy = max(0, min(1000 - 200, sy))
-                
-                search_crops[b] = search[b, :, sy:sy+200, sx:sx+200]
-                
-                peak_x = gx - sx + 35.0
-                peak_y = gy - sy + 35.0
-                
-                # Vectorized generation of repeating grid of targets (171x171)
-                # The DRAM grid repeats every 10 pixels. 
-                y, x = torch.meshgrid(
-                    torch.arange(171, dtype=torch.float32, device=device),
-                    torch.arange(171, dtype=torch.float32, device=device),
-                    indexing='ij'
-                )
-                
-                dx = torch.arange(-80, 81, 10, dtype=torch.float32, device=device)
-                dy = torch.arange(-80, 81, 10, dtype=torch.float32, device=device)
-                
-                cx = peak_x + dx
-                cy = peak_y + dy
-                
-                # Compute distance squared from all grid peaks [len(cy), len(cx), 171, 171]
-                # Then sum the exp() over the peaks
-                # Since the peaks are far apart, summing probabilities is valid.
-                dist_sq = (x.unsqueeze(0).unsqueeze(0) - cx.unsqueeze(1).unsqueeze(2).unsqueeze(3))**2 + \
-                          (y.unsqueeze(0).unsqueeze(0) - cy.unsqueeze(0).unsqueeze(2).unsqueeze(3))**2
-                          
-                target = torch.exp(-dist_sq / (2.0 * 2.0**2)).sum(dim=(0, 1))
-                target = target / target.sum()
-                target_heatmaps[b] = target.view(-1)
-            
+        epoch_loss = 0.0
+
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epochs}")
+        for ref, search, target_heatmap in pbar:
+            ref = ref.to(device, non_blocking=True)
+            search = search.to(device, non_blocking=True)
+            target_heatmap = target_heatmap.to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+
             with torch.amp.autocast('cuda'):
-                pred_heatmap = model(ref, search_crops)
-                pred_heatmap = pred_heatmap.reshape(B, -1)
-                loss = F.cross_entropy(pred_heatmap, target_heatmaps)
-            
+                # Forward pass: model outputs [B, 1, 125, 125]
+                pred_heatmap = model(ref, search)
+
+                # Reshape for spatial cross-entropy:
+                # pred:   [B, 125*125] (logits)
+                # target: [B, 125*125] (soft probability distribution)
+                B = pred_heatmap.size(0)
+                pred_flat = pred_heatmap.reshape(B, -1)         # [B, 15625]
+                target_flat = target_heatmap.reshape(B, -1)     # [B, 15625]
+
+                # Spatial cross-entropy: -sum(target * log_softmax(pred))
+                log_pred = F.log_softmax(pred_flat, dim=1)
+                loss = -(target_flat * log_pred).sum(dim=1).mean()
+
             scaler.scale(loss).backward()
-            
             scaler.step(optimizer)
             scaler.update()
-            optimizer.zero_grad()
-                
+
             epoch_loss += loss.item()
-            pbar.set_postfix({'loss': f"{loss.item():.6f}"})
-            
+            pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+
+        scheduler.step()
+
         avg_loss = epoch_loss / len(dataloader)
-        print(f"Epoch {epoch+1} Average Loss: {avg_loss:.6f}")
-        
+        lr = optimizer.param_groups[0]['lr']
+        print(f"Epoch {epoch + 1} — Avg Loss: {avg_loss:.4f}, LR: {lr:.6f}")
+
+        # Save weights after every epoch
         torch.save(model.state_dict(), 'gravnet_weights.pt')
-        print("Model weights saved.")
+        print("Weights saved.\n")
+
+    print("Training complete.")
+
 
 if __name__ == '__main__':
     train()
