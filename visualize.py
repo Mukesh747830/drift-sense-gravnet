@@ -94,19 +94,28 @@ def visualize_prediction(model_path, search_path, ref_path, gt_x=None, gt_y=None
 
 
 if __name__ == "__main__":
+    import random
     labels_path = Path("dataset/labels.json")
-    gt_x, gt_y = None, None
-    if labels_path.exists():
+    
+    if not labels_path.exists():
+        print("Dataset not found. Run dataset_generator.py first.")
+    else:
         with open(labels_path, 'r') as f:
             data = json.load(f)
+            
         if len(data) > 0:
-            gt_x = data[0]['gt_x']
-            gt_y = data[0]['gt_y']
-
-    visualize_prediction(
-        model_path="gravnet_weights.pt",
-        search_path="dataset/search/0000.png",
-        ref_path="dataset/reference/0000.png",
-        gt_x=gt_x,
-        gt_y=gt_y,
-    )
+            # Pick a random sample from the dataset
+            sample = random.choice(data)
+            
+            search_file = f"dataset/{sample['search_image']}"
+            ref_file = f"dataset/{sample['ref_image']}"
+            
+            print(f"Visualizing random sample: {search_file}")
+            
+            visualize_prediction(
+                model_path="gravnet_weights.pt",
+                search_path=search_file,
+                ref_path=ref_file,
+                gt_x=sample['gt_x'],
+                gt_y=sample['gt_y'],
+            )
