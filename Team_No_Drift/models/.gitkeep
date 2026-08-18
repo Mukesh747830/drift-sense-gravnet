@@ -1,2 +1,0 @@
-# This folder is reserved for model weights.
-# The current baseline relies on algorithmic spatial filtering (CV2) rather than learned weights.
